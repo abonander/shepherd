@@ -179,9 +179,7 @@ impl ServerInfo {
         let columns: Vec<_> = proc_stat.words().map(ToOwned::to_owned).collect();
 
         // Get kernel time and user time
-        let cputime_ticks: u64 = columns[13].parse::<u64>().unwrap() + columns[14].parse().unwrap();
-        let cputime = ticks_to_s(cputime_ticks);
- 
+        let cputime_ticks: u64 = columns[13].parse::<u64>().unwrap() + columns[14].parse().unwrap(); 
         let start_time = ticks_to_s(columns[21].parse().unwrap());
         
         let runtime = uptime - start_time;

@@ -1,5 +1,5 @@
 use std::borrow::ToOwned;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::{self, Formatter, Show};
 use std::io::{File, IoError, IoErrorKind, IoResult};
 use std::io::fs::PathExtensions;
