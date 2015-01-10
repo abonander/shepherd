@@ -80,10 +80,9 @@ fn opt_to_toml_res<T>(opt: Option<T>) -> IoResult<T> {
 pub struct ServerConfig {
     pub dir: String,
     pub command: String,
-    pub restart_on_death: Option<bool>,
+    pub auto_restart: Option<bool>,
     pub on_stop: Option<String>,
     pub stop_timeout: Option<u64>,
-    pub trim_command: Option<String>,                  
 }
 
 impl Show for ServerConfig {
