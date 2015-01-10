@@ -6,6 +6,7 @@ use std::fmt;
 use std::io::{BufferedReader, File, IoResult};
 use std::io::process::{Command, Process};
 use std::io::pipe::PipeStream;
+use std::os;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::thread::Thread;
 
@@ -148,14 +149,15 @@ impl fmt::String for ExitStatus {
 pub struct ServerInfo {
     pub pid: i32,
     pub percent_cpu: f32,
-    pub memory_usage: u64,
+    pub memory_usage: usize,
     pub uptime: u64, 
 }
 
 impl ServerInfo {
     fn for_process(pid: i32) -> IoResult<ServerInfo> {
+        use libc::sysconf;
+
         fn ticks_per_second() -> u64 {
-            use libc::sysconf;
             use libc::consts::os::sysconf::_SC_CLK_TCK;
 
             unsafe { sysconf(_SC_CLK_TCK) as u64 }
@@ -181,14 +183,13 @@ impl ServerInfo {
         let cputime = ticks_to_s(cputime_ticks);
  
         let start_time = ticks_to_s(columns[21].parse().unwrap());
+        
         let runtime = uptime - start_time;
-
-        let percent_cpu = (cputime as f32) / (runtime as f32);
-       
+         
         Ok(ServerInfo {
             pid: pid,
-            percent_cpu: percent_cpu,
-            memory_usage: columns[23].parse().unwrap(),
+            percent_cpu: ticks_to_s(cputime_ticks * 100) as f32 / runtime as f32,
+            memory_usage: columns[23].parse::<usize>().unwrap() * os::page_size(),
             uptime: runtime,
         })             
     }
@@ -201,7 +202,7 @@ impl fmt::String for ServerInfo {
                 "PID: {} Avg CPU: {:.02}% Memory: {} Uptime: {}",
                 self.pid,
                 self.percent_cpu,
-                FormatBytes(self.memory_usage),
+                FormatBytes(self.memory_usage as u64),
                 FormatTime::from_s(self.uptime)
             )
         )
