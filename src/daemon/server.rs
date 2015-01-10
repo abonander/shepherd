@@ -14,7 +14,8 @@ pub const STOP_TIMEOUT: Option<u64> = Some(10000);
 pub struct Server {
    process: Process,
    config: ServerConfig,
-   lines: Receiver<String>,   
+   lines: Receiver<String>,
+   log: Vec<String>, 
 }
 
 impl Server {
@@ -28,7 +29,8 @@ impl Server {
         Ok(Server {
             process: process,
             config: config,
-            lines: lines
+            lines: lines,
+            log: Vec::new(),
         })             
     }
 
@@ -91,24 +93,24 @@ impl Server {
         None
     }
 
-    pub fn tail(&mut self, lines: usize) -> Vec<String> {
-        let mut lines_buf = Vec::new();
-
+    pub fn tail(&mut self, lines: usize) -> &[String] {
         while let Some(line) = self.read_line(100) {
-            lines_buf.push(line);     
+            self.log.push(line);     
         }
         
-        let offset = if lines_buf.len() > lines {
-            lines_buf.len() - lines    
+        truncate_back(&mut self.log, 80);
+        
+        let offset = if lines > self.log.len() {
+            0    
         } else {
-            return lines_buf;    
+            self.log.len() - lines    
         };
 
-        let ptr = lines_buf[offset..].as_ptr();
-        unsafe {
-            lines_buf.set_len(offset);
-            Vec::from_raw_buf(ptr, lines)
-        } 
+        &self.log[offset..]
+    }
+    
+    pub fn auto_restart(&self) -> bool {
+        self.config.auto_restart.unwrap_or(false) 
     }
 }
 
@@ -139,7 +141,7 @@ pub struct ServerInfo {
 impl ServerInfo {
     fn for_process(pid: i32) -> IoResult<ServerInfo> {
         fn ticks_per_second() -> u64 {
-            use libc::funcs::posix88::unistd::sysconf;
+            use libc::sysconf;
             use libc::consts::os::sysconf::_SC_CLK_TCK;
 
             unsafe { sysconf(_SC_CLK_TCK) as u64 }
@@ -207,4 +209,18 @@ fn read_lines_threaded(stream: PipeStream) -> Receiver<String> {
     });
 
     rx
+}
+
+fn truncate_back<T>(vec: &mut Vec<T>, len: usize) {
+    let offset = if vec.len() > len {
+        vec.len() - len    
+    } else {
+        return;    
+    };
+
+    let ptr = vec[offset..].as_ptr();
+    unsafe {
+        vec.set_len(offset);
+        *vec = Vec::from_raw_buf(ptr, len);
+    }
 }

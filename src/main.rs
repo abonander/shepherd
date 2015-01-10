@@ -14,7 +14,7 @@ mod config;
 mod daemon;
 mod util;
 
-const MAX_TIMEOUTS: u32 = 200;
+const MAX_TIMEOUTS: u32 = 20;
 
 fn main() {
     let mut args = os::args();
@@ -36,7 +36,7 @@ fn main() {
 
     if args.is_empty() {    
         if command_loop(daemon).is_err() {
-            stdio::println("\nServer closed connection.");
+            stdio::println("\nConnection timed out..");
         } else {
             stdio::println("\nExiting...");
         }

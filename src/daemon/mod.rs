@@ -7,7 +7,8 @@ use self::server::Server;
 
 use std::borrow::ToOwned;
 use std::collections::hash_map::{Entry, HashMap};
-use std::io::{Acceptor, BufferedStream, IoResult, Listener};
+use std::error::FromError;
+use std::io::{Acceptor, BufferedStream, IoError, Listener};
 use std::io::fs::{self, PathExtensions};
 use std::io::net::pipe::{UnixAcceptor, UnixListener, UnixStream};
 
@@ -33,11 +34,20 @@ pub fn start(config: Config) {
     acceptor.set_timeout(TIMEOUT);
 
     let mut daemon = Daemon::new(config, acceptor);
-    let ref mut clients: Vec<ClientStream> = Vec::new();
+    let mut clients: Vec<ClientStream> = Vec::new();
 
-    loop {
-        daemon.manage_clients(clients);
-    }  
+    while daemon.manage_clients(&mut clients) {
+        daemon.check_instances();
+    }
+
+    for mut client in clients.into_iter() {
+        let client = client.get_mut();
+        if let Err(err) = client.close_write().and_then(|_| client.close_read()) {
+            println!("Error closing client: {}", err);    
+        }
+    }
+
+    daemon.acceptor.close_accept().unwrap();
 }
 
 pub type ClientStream = BufferedStream<UnixStream>;
@@ -61,7 +71,7 @@ impl Daemon {
         }    
     }
 
-    fn manage_clients(&mut self, clients: &mut Vec<ClientStream>) {
+    fn manage_clients(&mut self, clients: &mut Vec<ClientStream>) -> bool {
         while let Ok(Some(client)) = ignore_timeout(self.acceptor.accept()) {
             println!("Client connected!");
             clients.push(buffered(client));
@@ -76,8 +86,10 @@ impl Daemon {
                 let args: Vec<_> = command.words().map(ToOwned::to_owned).collect();
                 println!("Received command: {:?}", args);
 
-                if let Err(err) = self.match_op(client, args) {
-                    println!("{}", err);    
+                match self.match_op(client, args) {
+                    Err(ClientError::Io(err)) => println!("Client IO Error: {}", err),
+                    Err(ClientError::Killed) => return false,
+                    Ok(_) => (), 
                 }
             } else {
                 println!("Client closed connection!");
@@ -88,9 +100,42 @@ impl Daemon {
         for idx in closed.into_iter() {
             clients.remove(idx);    
         }
+
+        true
     }
 
-    fn match_op(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> IoResult<()> {
+    fn check_instances(&mut self) {
+        let mut to_remove = Vec::new();
+
+        for (server, instance) in self.servers.iter_mut() {
+            if !instance.is_alive() && instance.auto_restart() {
+                println!("\"{}\" has died!\nLast five lines of log:", server);
+                for line in instance.tail(5).iter() {
+                    println!("{}", line);    
+                }
+
+                if let Some(config) = self.config.servers.get(server).cloned() {
+                    println!("Restarting \"{}\"...", server);
+                    *instance = match Server::spawn(config) {
+                        Ok(new_instance) => new_instance,
+                        Err(err) => {
+                            println!("Error restarting \"{}\": {}", server, err);
+                            continue;
+                        }
+                    }
+                } else {
+                    println!("Lost config for \"{}\"!", server);
+                    to_remove.push(server.clone());    
+                }                 
+            }
+        }
+
+        for server in to_remove.iter() {
+            self.servers.remove(server);    
+        }
+    }
+
+    fn match_op(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> ClientResult<()> {
         if !args.is_empty() {
             let op = args.remove(0);
 
@@ -107,27 +152,26 @@ impl Daemon {
                 "kill-daemon" => self.kill_daemon(client),
                 "ops" => list_ops(client),
                 _ => {
-                    writeln!(client, "Unrecognized command: {}", op)
+                    ce(writeln!(client, "Unrecognized command: {}", op))
                         .and_then(|_| list_ops(client))
                 },
             }
         } else {
             list_ops(client)    
-        }.and_then(|&mut: _| client.flush())
+        }.and_then(|&mut: _| ce(client.flush()))
     }
 
-    fn start_server(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> IoResult<()> {
+    fn start_server(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> ClientResult<()> {
         if args.is_empty() {
-            return client.write_line("Usage: start <server>");
-        }
+            return ce(client.write_line("Usage: start <server>"));        }
 
         let server = args.remove(0);
                 
-        match self.servers.entry(server.clone()) {
+        ce(match self.servers.entry(server.clone()) {
             Entry::Occupied(_) => writeln!(client, "Server \"{}\" already running!", server),
             Entry::Vacant(vacant) => {
                 if let Some(config) = self.config.servers.get(&*server) {
-                    try!(writeln!(client, "Starting \"{:?}\"...", server).and_then(|_| client.flush()));
+                    try!(writeln!(client, "Starting \"{}\"...", server).and_then(|_| client.flush()));
                     match Server::spawn(config.clone()) {
                         Ok(instance) => {
                             vacant.insert(instance);
@@ -139,12 +183,12 @@ impl Daemon {
                     writeln!(client, "No configuration for \"{}\"", server)
                 }
             }
-        }
+        })
     }
 
-    fn stop_server(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> IoResult<()> {
+    fn stop_server(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> ClientResult<()> {
         if args.is_empty() {
-            return client.write_line("Usage: stop <server>");
+            return ce(client.write_line("Usage: stop <server>"));
         }
 
         let server = args.remove(0);
@@ -152,13 +196,13 @@ impl Daemon {
         if let Some(mut instance) = self.servers.remove(&*server) {
             stop_server(&*server, &mut instance, client).map(|_| ())            
         } else {
-            writeln!(client, "No running instance of \"{}\"", server)    
+            ce(writeln!(client, "No running instance of \"{}\"", server))
         }
     }
 
-    fn restart_server(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> IoResult<()> {
+    fn restart_server(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> ClientResult<()> {
         if args.is_empty() {
-            return client.write_line("Usage: restart <server>");
+            return ce(client.write_line("Usage: restart <server>"));
         }
 
         let server = args.remove(0);
@@ -172,35 +216,36 @@ impl Daemon {
         }
          
         // Start server
-        if let Some(config) = self.config.servers.get(&*server) {
+        ce(if let Some(config) = self.config.servers.get(&*server) {
             let instance = try!(Server::spawn(config.clone()));
             let res = writeln!(client, "Server \"{}\" started!", server);
             self.servers.insert(server, instance);
             res
         } else {
             writeln!(client, "No configuration for \"{}\"! Did the configuration change?", server)
-        }
+        })
     }
 
-    fn server_status(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> IoResult<()> {
+    fn server_status(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> ClientResult<()> {
         if args.is_empty() {
-            return client.write_line("Usage: status <server>"); 
+            return ce(client.write_line("Usage: status <server>")); 
         }
 
         let server = args.remove(0);
 
-        if let Some(instance) = self.servers.get_mut(&*server) {
-            instance.write_status(client)  
+        ce(if let Some(instance) = self.servers.get_mut(&*server) {
+            try!(writeln!(client, "Server instance \"{}\" ", server));
+            instance.write_status(client)
         } else {
-            writeln!(client, "No running instance of \"{}\"", server)  
-        }
+            writeln!(client, "No running instance of \"{}\"", server)
+        })
     }
 
-    fn server_tail(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> IoResult<()> {
+    fn server_tail(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> ClientResult<()> {
         const DEFAULT_LINE_COUNT: usize = 20;
         
         if args.is_empty() {
-            return client.write_line("Usage: tail <server> [lines]");    
+            return ce(client.write_line("Usage: tail <server> [lines]"));
         }
 
         let server = args.remove(0);
@@ -208,25 +253,25 @@ impl Daemon {
 
         if let Some(instance) = self.servers.get_mut(&*server) {
             try!(writeln!(client, "Last {} lines from \"{}\":", lines, server).and_then(|_| client.flush()));
-            for line in instance.tail(lines).into_iter() {
-                try!(client.write_str(&*line));    
+            for line in instance.tail(lines).iter() {
+                try!(client.write_str(&**line));    
             }
 
             Ok(())
         } else {
-            writeln!(client, "No running instance of \"{}\"", server)    
+            ce(writeln!(client, "No running instance of \"{}\"", server))
         }
     }
 
-    fn server_send(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> IoResult<()> {
+    fn server_send(&mut self, client: &mut ClientStream, mut args: Vec<String>) -> ClientResult<()> {
         if args.is_empty() {
-            return client.write_line("Usage: send <server> <command>");    
+            return ce(client.write_line("Usage: send <server> <command>"));
         }
 
         let server = args.remove(0);
         let command = args.connect(" ");
 
-        if let Some(instance) = self.servers.get_mut(&*server) {
+        ce(if let Some(instance) = self.servers.get_mut(&*server) {
             try!(writeln!(client, "Sending command to \"{}\": {}", server, command).and_then(|_| client.flush()));
             try!(instance.send_command(&*command));
             if let Some(line) = instance.tail(1).get(0) {
@@ -235,11 +280,11 @@ impl Daemon {
                 Ok(())
             }
         } else {
-            writeln!(client, "No running instance of \"{}\"", server)    
-        }
+            writeln!(client, "No running instance of \"{}\"", server)
+        })
     }
 
-    fn list_servers(&mut self, client: &mut ClientStream) -> IoResult<()> {
+    fn list_servers(&mut self, client: &mut ClientStream) -> ClientResult<()> {
         try!(client.write_line("Servers:"));
         for (server, config) in self.config.servers.iter() {
             try!(writeln!(client, "\"{}\":\n{:?}", server, config));    
@@ -247,7 +292,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn list_instances(&mut self, client: &mut ClientStream) -> IoResult<()> {
+    fn list_instances(&mut self, client: &mut ClientStream) -> ClientResult<()> {
         try!(client.write_line("Running instances:"));
         for (server, instance) in self.servers.iter_mut() {
             try!(write!(client, "\"{}\" ", server));
@@ -256,7 +301,7 @@ impl Daemon {
         Ok(())        
     }
 
-    fn reload_config(&mut self, client: &mut ClientStream) -> IoResult<()> {
+    fn reload_config(&mut self, client: &mut ClientStream) -> ClientResult<()> {
         try!(
             client.write_line("Reloading config. Will not affect existing server instances.")
                 .and_then(|_| client.flush())
@@ -264,13 +309,13 @@ impl Daemon {
 
         self.config = match Config::load() {
             Ok(config) => config,
-            Err(err) => return writeln!(client, "Failed to load config: {:?}", err),
+            Err(err) => return ce(writeln!(client, "Failed to load config: {:?}", err)),
         };
 
-        client.write_line("Config reloaded.")
+        ce(client.write_line("Config reloaded."))
     }
 
-    fn kill_daemon(&mut self, client: &mut ClientStream) -> IoResult<()> { 
+    fn kill_daemon(&mut self, client: &mut ClientStream) -> ClientResult<()> { 
         try!(client.write_line("Killing servers..."));
         for (server, mut instance) in self.servers.drain() {
             let _  = stop_server(&*server, &mut instance, client);
@@ -279,37 +324,57 @@ impl Daemon {
 
         try!(
             client.write_line("Daemon exiting. Any servers that failed to stop will die now.")
-                .and_then(|&mut: _| client.flush())
+                .and_then(|_| client.flush())
+                .and_then(|_| client.write(&[0; 64]))
         );
 
-        
-        panic!("Daemon exiting!");
+        Err(ClientError::Killed)
     }
 }
 
-fn stop_server(server: &str, instance: &mut Server, client: &mut ClientStream) -> IoResult<bool> {
+fn stop_server(server: &str, instance: &mut Server, client: &mut ClientStream) -> ClientResult<bool> {
     try!(writeln!(client, "Sending stop command to \"{}\"...", server).and_then(|_| client.flush()));
-    match instance.stop() {
+    ce(match instance.stop() {
         Ok(exit_status) => writeln!(client, "\"{}\" stopped. Status: {}", server, exit_status)
             .map(|_| true),
         Err(err) => writeln!(client, "Failed to stop \"{}\"! Message: {}", server, err)
             .map(|_| false),
-    } 
+    })
 }
 
-fn list_ops(writer: &mut Writer) -> IoResult<()> {
-    writer.write_line(r#"
+fn list_ops(writer: &mut Writer) -> ClientResult<()> {
+    ce(writer.write_line(r#"
 shepherd ops:
     start <server>
     stop <server> 
     restart <server>
-    trim <server>
-    attach <server>
+    tail <server> [lines]
+    send <server> <commandt
     status <server>
     servers
     instances
     ops
     kill-daemon
-"#)   
+"#))  
 }
+
+type ClientResult<T> = Result<T, ClientError>;
+
+enum ClientError {
+    Io(IoError),
+    Killed,    
+}
+
+impl FromError<IoError> for ClientError {
+    #[inline]
+    fn from_error(e: IoError) -> ClientError {
+        ClientError::Io(e)
+    }
+}
+
+#[inline]
+fn ce<T>(res: Result<T, IoError>) -> ClientResult<T> {
+    res.map_err(FromError::from_error)    
+}
+
 
