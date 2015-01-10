@@ -36,6 +36,8 @@ pub fn start(config: Config) {
     let mut daemon = Daemon::new(config, acceptor);
     let mut clients: Vec<ClientStream> = Vec::new();
 
+    daemon.start_servers();
+
     while daemon.manage_clients(&mut clients) {
         daemon.check_instances();
     }
@@ -69,6 +71,23 @@ impl Daemon {
             acceptor: acceptor,
             servers: HashMap::new(),
         }    
+    }
+
+    fn start_servers(&mut self) {
+        for server in self.config.start_servers.iter().cloned() {
+            if let Some(config) = self.config.servers.get(&*server).cloned() {
+                println!("Auto-starting \"{}\"...", server);
+                match Server::spawn(config) {
+                    Ok(instance) => {
+                        println!("\"{}\" started!", server);
+                        self.servers.insert(server, instance);
+                    },
+                    Err(err) => println!("Error auto-starting \"{}\": {}", server, err),                       
+                }
+            } else {
+                println!("No config found for \"{}\"", server);    
+            }
+        }            
     }
 
     fn manage_clients(&mut self, clients: &mut Vec<ClientStream>) -> bool {

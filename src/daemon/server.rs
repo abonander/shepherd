@@ -22,7 +22,16 @@ impl Server {
     pub fn spawn(config: ServerConfig) -> IoResult<Server> {
         let ref dir = Path::new(&*config.dir);
         let mut command = Command::new(&*config.command);
-        let process = try!(command.cwd(dir).spawn());
+        
+        for arg in config.args.iter() {
+            command.arg(arg);    
+        }
+
+        command.cwd(dir);
+        
+        println!("Starting process: {}", command);
+
+        let process = try!(command.spawn());
 
         let lines = read_lines_threaded(process.stdout.clone().unwrap());
 
@@ -57,9 +66,13 @@ impl Server {
         
         self.process.set_timeout(self.config.stop_timeout.or(STOP_TIMEOUT));
 
-        if let Some(on_stop) = self.config.on_stop.clone() {
+        if !self.config.on_stop.is_empty() {
             // Asking the server to stop with the given command
-            try!(self.send_command(&*on_stop));
+
+            for command in self.config.on_stop.clone().into_iter() {
+                try!(self.send_command(&*command));
+            }
+
             if let Ok(_) = self.process.wait() {
                 return Ok(ExitStatus::Stopped);    
             }
@@ -133,6 +146,7 @@ impl fmt::String for ExitStatus {
 }
 
 pub struct ServerInfo {
+    pub pid: i32,
     pub percent_cpu: f32,
     pub memory_usage: u64,
     pub uptime: u64, 
@@ -172,9 +186,10 @@ impl ServerInfo {
         let percent_cpu = (cputime as f32) / (runtime as f32);
        
         Ok(ServerInfo {
-           percent_cpu: percent_cpu,
-           memory_usage: columns[23].parse().unwrap(),
-           uptime: runtime,
+            pid: pid,
+            percent_cpu: percent_cpu,
+            memory_usage: columns[23].parse().unwrap(),
+            uptime: runtime,
         })             
     }
 }
@@ -183,7 +198,8 @@ impl fmt::String for ServerInfo {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         fmt.write_fmt(
             format_args!(
-                "Avg CPU: {:.02}% Memory: {} Uptime: {}", 
+                "PID: {} Avg CPU: {:.02}% Memory: {} Uptime: {}",
+                self.pid,
                 self.percent_cpu,
                 FormatBytes(self.memory_usage),
                 FormatTime::from_s(self.uptime)

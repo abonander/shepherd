@@ -21,7 +21,7 @@ impl RemoteDaemon {
     fn connect(socket: &str) -> IoResult<RemoteDaemon> {
         let client_stream = try!(UnixStream::connect_timeout(socket, Duration::milliseconds(2000)));
 
-        let timeout_thread = TimeoutThread::new(Duration::seconds(5));
+        let timeout_thread = TimeoutThread::new(Duration::seconds(10));
 
         Ok(RemoteDaemon {
             stream: super::buffered(client_stream),
@@ -52,7 +52,7 @@ impl RemoteDaemon {
 
     pub fn write_response<W: Writer>(&mut self, w: &mut W, max_timeouts: u32) -> IoResult<()> {
         let mut timeouts = 0u32;
-        self.stream.get_mut().set_timeout(Some(200));
+        self.stream.get_mut().set_timeout(Some(1000));
 
         loop {
             self.timeout_thread.start();

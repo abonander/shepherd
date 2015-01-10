@@ -1,5 +1,5 @@
 use std::borrow::ToOwned;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Formatter, Show};
 use std::io::{File, IoError, IoErrorKind, IoResult};
 use std::io::fs::PathExtensions;
@@ -27,42 +27,45 @@ fn find_config() -> IoResult<Path> {
     )
 }
 
+#[derive(RustcDecodable)]
+struct TomlDecode {
+    shepherd: Shepherd,
+    servers: HashMap<String, ServerConfig>,          
+}
+
+impl TomlDecode {
+    fn into_config(self) -> Config {
+        let socket_path = self.shepherd.socket_path
+            .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
+        
+        Config {
+            socket_path: socket_path,
+            start_servers: self.shepherd.start_servers,
+            servers: self.servers,
+        }    
+    }    
+}
+
+#[derive(RustcDecodable)]
+struct Shepherd {
+    socket_path: Option<String>,
+    start_servers: Vec<String>,             
+}
 
 pub struct Config {
     pub socket_path: String,
+    pub start_servers: Vec<String>,
     pub servers: HashMap<String, ServerConfig>,    
 }
 
 impl Config {
     pub fn load() -> IoResult<Config> {
         let config_path = try!(find_config());
-        let config_file = try!(
-            File::open(&config_path).and_then(|mut file| file.read_to_string())
-        );        
-        
-        let config_toml = try!(opt_to_toml_res(config_file.parse::<toml::Value>()));
+        let config_file = try!(File::open(&config_path).read_to_string());        
+       
+        let toml_decode = try!(opt_to_toml_res(toml::decode_str::<TomlDecode>(&*config_file)));
 
-        let socket_path = config_toml.lookup("shepherd.socket_path")
-            .and_then(toml::Value::as_str)
-            .unwrap_or(DEFAULT_SOCKET_PATH)
-            .to_owned();
-
-        let mut servers = HashMap::new();
-
-        for (key, value) in try!(
-            opt_to_toml_res(config_toml.lookup("servers")
-                .and_then(toml::Value::as_table)
-            )).to_owned().into_iter() 
-        {
-            let value = try!(opt_to_toml_res(toml::decode::<ServerConfig>(value)));
-
-            servers.insert(key, value);              
-        }
-
-        Ok(Config {
-            socket_path: socket_path,
-            servers: servers,
-        })                              
+        Ok(toml_decode.into_config())                              
     }    
 }
 
@@ -82,13 +85,13 @@ pub struct ServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub auto_restart: Option<bool>,
-    pub on_stop: Option<String>,
+    pub on_stop: Vec<String>,
     pub stop_timeout: Option<u64>,
 }
 
 impl Show for ServerConfig {
     fn fmt(&self, fmt: &mut Formatter) -> Result<(), fmt::Error> {
-        fmt.write_fmt(format_args!("directory: {}\ncommand: {}", self.dir, self.command))
+        fmt.write_fmt(format_args!("directory: {}\ncommand: {}\nargs: {:?}", self.dir, self.command, self.args))
     }
 }
 
