@@ -4,6 +4,15 @@ name = "shepherd"
 version = "0.0.1"
 authors = ["Austin Bonander <austin.bonander@gmail.com>"]
 
+[[bin]]
+name="shepherd"
+path="src/main.rs"
+
+[[bin]]
+name="echo"
+path="src/echo.rs"
+
 [dependencies]
 toml = "*"
 rustc-serialize = "*"
+time = "*"
