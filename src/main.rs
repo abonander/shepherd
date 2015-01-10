@@ -1,3 +1,7 @@
+#![allow(unstable)]
+
+extern crate libc;
+extern crate time;
 extern crate toml;
 extern crate "rustc-serialize" as rustc_serialize;
 
@@ -9,6 +13,8 @@ use std::os;
 mod config;
 mod daemon;
 mod util;
+
+const MAX_TIMEOUTS: u32 = 200;
 
 fn main() {
     let mut args = os::args();
@@ -37,7 +43,7 @@ fn main() {
     } else {
         let ref mut stdout = stdio::stdout();
         daemon.send_command(&*args.connect(" ")).unwrap();
-        daemon.write_response(stdout).unwrap();
+        daemon.write_response(stdout, MAX_TIMEOUTS).unwrap();
     }
 }
 
@@ -47,7 +53,7 @@ fn command_loop(mut daemon: RemoteDaemon) -> IoResult<()> {
     try!(stdout.write_str("> ").and_then(|_| stdout.flush()));
     for line in stdio::stdin().lock().lines().filter_map(|line| line.ok()) {
         try!(daemon.send_command(&*line));
-        try!(daemon.write_response(&mut stdout));
+        try!(daemon.write_response(&mut stdout, MAX_TIMEOUTS));
         try!(stdout.write_str("> ").and_then(|_| stdout.flush()));        
     }
     

@@ -1,20 +1,20 @@
 use config::ServerConfig;
-use util::{FormatBytes, ignore_timeout};
+use util::{FormatBytes, FormatTime, precise_time_ms};
 
 use std::borrow::ToOwned;
-use std::fmt::{self, Show, Formatter};
-use std::io::IoResult;
-use std::io::util::copy;
+use std::fmt;
+use std::io::{BufferedReader, File, IoResult};
 use std::io::process::{Command, Process};
-use std::io::net::pipe::UnixStream;
 use std::io::pipe::PipeStream;
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::thread::Thread;
 
 pub const STOP_TIMEOUT: Option<u64> = Some(10000);
 
 pub struct Server {
    process: Process,
-   config: ServerConfig,     
+   config: ServerConfig,
+   lines: Receiver<String>,   
 }
 
 impl Server {
@@ -23,9 +23,12 @@ impl Server {
         let mut command = Command::new(&*config.command);
         let process = try!(command.cwd(dir).spawn());
 
+        let lines = read_lines_threaded(process.stdout.clone().unwrap());
+
         Ok(Server {
             process: process,
             config: config,
+            lines: lines
         })             
     }
 
@@ -39,25 +42,12 @@ impl Server {
 
     pub fn write_status(&mut self, w: &mut Writer) -> IoResult<()> {
         if self.is_alive() {
-            writeln!(w, "Status: Running {}", ServerInfo::for_process(self.pid()))
+            writeln!(w, "Status: Running [{}]", try!(ServerInfo::for_process(self.pid())))
         } else {
             w.write_line("Status: Stopped")
         }                
     }
-
-    pub fn attach_process(&mut self, client: &mut UnixStream) {
-        let mut send_server = SendServer {
-            client: client.clone(),
-            stdin: self.process.stdin.as_ref().unwrap().clone(),
-            stdout: self.process.stdout.as_ref().unwrap().clone(),
-        };
-
-        Thread::spawn(move || {
-            send_server.copy().unwrap()
-        })
-        .detach();     
-    }
-
+ 
     pub fn stop(&mut self) -> IoResult<ExitStatus> {
         if !self.is_alive() {
             return Ok(ExitStatus::AlreadyStopped);    
@@ -65,9 +55,9 @@ impl Server {
         
         self.process.set_timeout(self.config.stop_timeout.or(STOP_TIMEOUT));
 
-        if let Some(ref on_stop) = self.config.on_stop {
+        if let Some(on_stop) = self.config.on_stop.clone() {
             // Asking the server to stop with the given command
-            try!(self.process.stdin.as_mut().unwrap().write_str(&**on_stop));
+            try!(self.send_command(&*on_stop));
             if let Ok(_) = self.process.wait() {
                 return Ok(ExitStatus::Stopped);    
             }
@@ -83,6 +73,43 @@ impl Server {
         try!(self.process.signal_kill());
         self.process.wait().map(|_| ExitStatus::Killed)                
     }
+
+    pub fn send_command(&mut self, command: &str) -> IoResult<()> {
+        let stdin = self.process.stdin.as_mut().unwrap();
+        stdin.write_line(command).and_then(|_| stdin.flush())
+    }
+
+    pub fn read_line(&mut self, timeout_ms: u64) -> Option<String> {
+        let start = precise_time_ms();
+
+        while (precise_time_ms() - start) < timeout_ms {
+            if let Ok(line) = self.lines.try_recv() {
+                return Some(line);
+            }          
+        }
+
+        None
+    }
+
+    pub fn tail(&mut self, lines: usize) -> Vec<String> {
+        let mut lines_buf = Vec::new();
+
+        while let Some(line) = self.read_line(100) {
+            lines_buf.push(line);     
+        }
+        
+        let offset = if lines_buf.len() > lines {
+            lines_buf.len() - lines    
+        } else {
+            return lines_buf;    
+        };
+
+        let ptr = lines_buf[offset..].as_ptr();
+        unsafe {
+            lines_buf.set_len(offset);
+            Vec::from_raw_buf(ptr, lines)
+        } 
+    }
 }
 
 pub enum ExitStatus {
@@ -92,8 +119,8 @@ pub enum ExitStatus {
     AlreadyStopped,        
 }
 
-impl Show for ExitStatus {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), fmt::Error> {
+impl fmt::String for ExitStatus {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         fmt.pad(match *self {
             ExitStatus::Stopped => "Stopped gently (used configured stop command)",
             ExitStatus::Terminated => "Terminated normally (no stop command or timed out)",
@@ -106,53 +133,78 @@ impl Show for ExitStatus {
 pub struct ServerInfo {
     pub percent_cpu: f32,
     pub memory_usage: u64,
-    pub uptime: String, 
+    pub uptime: u64, 
 }
 
 impl ServerInfo {
     fn for_process(pid: i32) -> IoResult<ServerInfo> {
-        let command = format!("ps -p {} -o %cpu,rss,etime --no-headers", pid);
+        fn ticks_per_second() -> u64 {
+            use libc::funcs::posix88::unistd::sysconf;
+            use libc::consts::os::sysconf::_SC_CLK_TCK;
 
-        let output = try!(Command::new(command).output());
-        let output = String::from_utf8_lossy(&*output.output);
-       
-        let columns: Vec<String> = output.words().map(ToOwned::to_owned).collect();
+            unsafe { sysconf(_SC_CLK_TCK) as u64 }
+        }
+
+        fn ticks_to_s(ticks: u64) -> u64 {
+            ticks / ticks_per_second()    
+        }
+
+        let ref proc_uptime_path = Path::new("/proc/uptime");
+        let proc_uptime = try!(File::open(proc_uptime_path).read_to_string());
+        let uptime = proc_uptime.words().next().and_then(|s| s.parse::<f64>()).unwrap() as u64;
+
+        let ref proc_stat_path = Path::new(format!("/proc/{}/stat", pid));
+        let proc_stat = try!(File::open(proc_stat_path).read_to_string());
+
+        // Indexes into `columns` taken from the man page for /proc/[pid]/stat
+        // Mind that the man page starts the indexes from 1 but these start from 0
+        let columns: Vec<_> = proc_stat.words().map(ToOwned::to_owned).collect();
+
+        // Get kernel time and user time
+        let cputime_ticks: u64 = columns[13].parse::<u64>().unwrap() + columns[14].parse().unwrap();
+        let cputime = ticks_to_s(cputime_ticks);
+ 
+        let start_time = ticks_to_s(columns[21].parse().unwrap());
+        let runtime = uptime - start_time;
+
+        let percent_cpu = (cputime as f32) / (runtime as f32);
        
         Ok(ServerInfo {
-           percent_cpu: columns[0].parse().unwrap(),
-           memory_usage: columns[1].parse().unwrap(),
-           uptime: columns[2].clone(),
+           percent_cpu: percent_cpu,
+           memory_usage: columns[23].parse().unwrap(),
+           uptime: runtime,
         })             
     }
 }
 
-impl Show for ServerInfo {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), fmt::Error> {
+impl fmt::String for ServerInfo {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         fmt.write_fmt(
             format_args!(
-                "CPU: {}% Memory: {} Uptime: {}", 
+                "Avg CPU: {:.02}% Memory: {} Uptime: {}", 
                 self.percent_cpu,
                 FormatBytes(self.memory_usage),
-                self.uptime
+                FormatTime::from_s(self.uptime)
             )
         )
     } 
 }
 
-struct SendServer {
-    client: UnixStream,
-    stdin: PipeStream,
-    stdout: PipeStream,
+const MAX_LINES: usize = 80;
+
+fn read_lines_threaded(stream: PipeStream) -> Receiver<String> {
+    let (tx, rx) = sync_channel(MAX_LINES);
+
+    Thread::spawn(move || {
+        let mut reader = BufferedReader::new(stream);
+        for line in reader.lines() {
+            let line = line.unwrap();
+
+            if !line.trim().is_empty() {
+                tx.send(line).unwrap();
+            }           
+        }
+    });
+
+    rx
 }
-
-impl SendServer {
-    fn copy(&mut self) -> IoResult<()> {
-        loop {
-            try!(ignore_timeout(copy(&mut self.client, &mut self.stdin)));
-            try!(ignore_timeout(copy(&mut self.stdout, &mut self.client)));
-        }    
-    }  
-}
-
-unsafe impl Send for SendServer {}
-

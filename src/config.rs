@@ -1,5 +1,6 @@
 use std::borrow::ToOwned;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::fmt::{self, Formatter, Show};
 use std::io::{File, IoError, IoErrorKind, IoResult};
 use std::io::fs::PathExtensions;
 
@@ -21,7 +22,7 @@ fn find_config() -> IoResult<Path> {
         IoError {
             kind: IoErrorKind::PathDoesntExist,
             desc: "Config file not found.",
-            detail: Some(format!("Searched paths: {}", CONFIG_PATHS))
+            detail: Some(format!("Searched paths: {:?}", CONFIG_PATHS))
         }
     )
 }
@@ -75,14 +76,6 @@ fn opt_to_toml_res<T>(opt: Option<T>) -> IoResult<T> {
     )   
 }
 
-fn both_some<L, R>(pair: (Option<L>, Option<R>)) -> Option<(L, R)> {
-    if let (Some(left), Some(right)) = pair {
-        Some((left, right))    
-    } else {
-        None
-    }
-}
-
 #[derive(Clone, RustcDecodable)]
 pub struct ServerConfig {
     pub dir: String,
@@ -92,3 +85,10 @@ pub struct ServerConfig {
     pub stop_timeout: Option<u64>,
     pub trim_command: Option<String>,                  
 }
+
+impl Show for ServerConfig {
+    fn fmt(&self, fmt: &mut Formatter) -> Result<(), fmt::Error> {
+        fmt.write_fmt(format_args!("directory: {}\ncommand: {}", self.dir, self.command))
+    }
+}
+

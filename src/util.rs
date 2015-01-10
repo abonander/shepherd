@@ -1,4 +1,4 @@
-use std::fmt::{self, Show, Formatter};
+use std::fmt;
 use std::io::{IoErrorKind, IoResult};
 
 #[derive(Copy)]
@@ -21,8 +21,8 @@ impl FormatBytes {
     }
 }
 
-impl Show for FormatBytes {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), fmt::Error> {
+impl fmt::String for FormatBytes {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self.0 {
             0 ... 999 => fmt.write_fmt(format_args!("{} B", self.0)),
             1_000 ... 999_999 => fmt.write_fmt(format_args!("{:.02} KB", self.to_kb())),
@@ -40,3 +40,26 @@ pub fn ignore_timeout<T>(result: IoResult<T>) -> IoResult<Option<T>> {
     }
 }
 
+pub fn precise_time_ms() -> u64 {
+    use time;
+    time::precise_time_ns() / 1_000_000    
+}
+
+pub struct FormatTime(pub u64, pub u8, pub u8);
+
+impl FormatTime {
+    pub fn from_s(s: u64) -> FormatTime {
+        let seconds = (s % 60) as u8;
+        let tot_min = s / 60;
+        let minutes = (tot_min % 60) as u8;
+        let hours = tot_min / 60;
+        
+        FormatTime(hours, minutes, seconds)               
+    }   
+}
+
+impl fmt::String for FormatTime {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        f.write_fmt(format_args!("{}:{:02}:{:02}", self.0, self.1, self.2))    
+    }    
+}

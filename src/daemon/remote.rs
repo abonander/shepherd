@@ -14,8 +14,7 @@ pub struct RemoteDaemon {
 
 impl RemoteDaemon {
     fn connect(socket: &str) -> IoResult<RemoteDaemon> {
-        let mut client_stream = try!(UnixStream::connect(socket));
-        client_stream.set_timeout(Some(5000));
+        let client_stream = try!(UnixStream::connect(socket));
 
         Ok(RemoteDaemon {
             stream: super::buffered(client_stream)
@@ -40,8 +39,21 @@ impl RemoteDaemon {
         self.stream.flush()
     }
 
-    pub fn write_response<W: Writer>(&mut self, w: &mut W) -> IoResult<()> {
-        ignore_timeout(copy(&mut self.stream, w)).map(|_| ())
+    pub fn write_response<W: Writer>(&mut self, w: &mut W, max_timeouts: u32) -> IoResult<()> {
+        let mut timeouts = 0u32;
+        self.stream.get_mut().set_timeout(Some(200));
+
+        loop {
+            if try!(ignore_timeout(copy(&mut self.stream, w))).is_none() {
+                timeouts += 1;
+
+                if timeouts > max_timeouts {
+                    break;    
+                }
+            }
+        }
+
+        w.flush()
     }
 }
 
